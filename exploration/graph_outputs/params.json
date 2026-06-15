@@ -1,0 +1,12 @@
+{
+  "N": 10000,
+  "I_0": 10,
+  "p_expose": 0.4,
+  "p_infect": 0.15,
+  "p_recover": 0.05,
+  "n_contacts": 3,
+  "k": 6,
+  "beta_ws": 0.05,
+  "T": 300,
+  "SEED": 42
+}
