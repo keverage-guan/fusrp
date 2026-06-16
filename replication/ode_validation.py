@@ -85,26 +85,29 @@ def seir_ode(N=10_000, I0=70, beta=0.12, alpha=1.0, gamma=1.0 / 27,
 # Grid replicate runner
 # ===========================================================================
 def run_grid_once(density, seed, max_days=400, init_infectious=70):
-    """Run one level-0 grid episode. Returns (reports, r0_mean, r0_median).
+    """Run one level-0 grid episode.
 
-    R0 stats use the Step-3 estimator over days with active cases > 0
-    (disagreement #6): the mean picks up the low-prevalence spikes, the median
-    stays near the typical reproduction rate.
-    """
+    Returns (reports, r0_seed_cohort, r0_early_cohort): the tau-free count of
+    distinct secondary infections per infectious agent, averaged over (a) the
+    seed cohort and (b) agents that turned infectious while S/N >= 0.95. This
+    replaces the old population estimator's mean/median, which was pinned near 1
+    by a closed-population conservation identity (see notes)."""
     env = PandemicEnv(density=density, init_infectious=init_infectious, seed=seed)
-    builder = StateBuilder(env)
-    reports, r0_active = [], []
+    builder = StateBuilder(env)            # daily dim-5 R0 observable still populated
+    reports = []
     while env.day < max_days:
         rep = env.run_day(restriction_level=0)
-        st = builder.build(rep)
+        builder.build(rep)
         reports.append(rep)
-        if rep["infectious"] > 0:
-            r0_active.append(st["r0"])
         if rep["exposed"] == 0 and rep["infectious"] == 0:
             break
-    r0_mean = float(np.mean(r0_active)) if r0_active else 0.0
-    r0_median = float(np.median(r0_active)) if r0_active else 0.0
-    return reports, r0_mean, r0_median
+
+    fin = env.completed
+    is_seed = (env.sfrac0 > 0.99) & fin
+    early = (env.sfrac0 >= 0.95) & fin
+    r0_seed = float(env.n_sec[is_seed].mean()) if is_seed.any() else 0.0
+    r0_early = float(env.n_sec[early].mean()) if early.any() else 0.0
+    return reports, r0_seed, r0_early
 
 
 def reports_to_pct(reports, N):
@@ -120,27 +123,28 @@ def reports_to_pct(reports, N):
 # ===========================================================================
 # Comparisons
 # ===========================================================================
-def table1_comparison(densities=(0.01, 0.02, 0.03), n_runs=N_RUNS, base_seed=0):
-    """Reproduce Table 1: mean/median R0 per density vs the paper."""
-    print(f"\n=== Table 1: reproduction rate vs density ({n_runs} runs each) ===")
-    print(f"{'density':>8} | {'grid R0 mean':>22} | {'grid R0 median':>22} | "
-          f"{'paper (mean/median)':>22}")
-    print("-" * 86)
+def table1_comparison(densities=(0.01, 0.02, 0.03, 0.10), n_runs=N_RUNS, base_seed=0):
+    """Cohort reproduction rate per density vs the paper."""
+    print(f"\n=== Table 1: cohort reproduction rate vs density ({n_runs} runs each) ===")
+    print(f"{'density':>8} | {'seed cohort R0':>18} | {'S>=0.95 cohort R0':>20} | "
+          f"{'paper (mean/med)':>18}")
+    print("-" * 74)
     results = {}
     for d in densities:
-        means, medians = [], []
+        seeds_r0, early_r0 = [], []
         for k in range(n_runs):
-            _, m, md = run_grid_once(d, seed=base_seed + 1000 * int(d * 1000) + k)
-            means.append(m); medians.append(md)
-        gm, gms = np.mean(means), np.std(means)
-        gmd, gmds = np.mean(medians), np.std(medians)
-        results[d] = (gm, gms, gmd, gmds)
+            _, rs, re = run_grid_once(d, seed=base_seed + 1000 * int(d * 1000) + k)
+            seeds_r0.append(rs); early_r0.append(re)
+        sm, ss = np.mean(seeds_r0), np.std(seeds_r0)
+        em, es = np.mean(early_r0), np.std(early_r0)
+        results[d] = (sm, ss, em, es)
         pap = PAPER_R0.get(round(d, 2))
         pstr = f"{pap[0]:.2f}/{pap[2]:.2f}" if pap else "n/a"
-        print(f"{d:>8.2f} | {gm:>10.2f} +/- {gms:<7.2f} | "
-              f"{gmd:>10.2f} +/- {gmds:<7.2f} | {pstr:>22}")
-    print("\nKey validation: R0 should stay roughly flat across densities "
-          "(nonlinearity / Hu et al.), while active-case waves grow with density.")
+        print(f"{d:>8.2f} | {sm:>9.2f} +/- {ss:<5.2f} | {em:>11.2f} +/- {es:<5.2f} | {pstr:>18}")
+    print("\nNote: cohort R0 RISES with density (3x3 neighbourhoods never saturate "
+          "at these occupancies), so Table 1's density-independence does NOT "
+          "reproduce under a faithful R0. The seed cohort at density 0.01 (~3.3) "
+          "is the cleanest match to the ODE's R0 = beta/gamma = 3.24.")
     return results
 
 

@@ -71,9 +71,6 @@ class PandemicEnv:
         """Initialise the grid and population. Returns the day-0 report."""
         self.rng = np.random.default_rng(self.seed)
         self.N = int(self.population)
-
-        # Grid side from density. round() reproduces the paper's 577 (0.03) and
-        # 1000 (0.01); gives 707 vs the paper's 708 for 0.02 (rounding only).
         self.L = int(round(sqrt(self.N / self.density)))
         self.realized_density = self.N / (self.L * self.L)
 
@@ -82,8 +79,14 @@ class PandemicEnv:
         self.state = np.full(self.N, SUSCEPTIBLE, dtype=np.int8)
         self.counter = np.zeros(self.N, dtype=np.int32)  # days in current state
 
+        # --- cohort-R0 bookkeeping (tau-free reproduction number) ---
+        self.n_sec = np.zeros(self.N, dtype=np.int32)     # secondaries caused by each agent
+        self.sfrac0 = np.full(self.N, np.nan)             # S/N when the agent turned infectious
+        self.completed = np.zeros(self.N, dtype=bool)     # agent has left the infectious state
+
         inf_idx = self.rng.choice(self.N, size=self.init_infectious, replace=False)
         self.state[inf_idx] = INFECTIOUS
+        self.sfrac0[inf_idx] = (self.N - self.init_infectious) / self.N  # seed cohort
 
         self.day = 0
         self.economy_cumulative = 0.0
@@ -161,46 +164,50 @@ class PandemicEnv:
         self.y[alive] = np.clip(self.y[alive] + self.rng.integers(-1, 2, size=n), 0, self.L - 1)
 
     def _infect(self) -> int:
-        """Susceptibles within a 3x3 (Chebyshev<=1) neighbourhood of any
-        infectious agent become Exposed. (Disagreement #2 and #6.)"""
+        """Susceptibles in a 3x3 (Chebyshev<=1) neighbourhood of an infectious
+        agent become EXPOSED. NB: this follows the PAPER (S->E). Pseudocode
+        line 36 literally writes the contact into I, which would erase the
+        latent period -- that is a pseudocode bug, not the intended model.
+
+        Cohort bookkeeping: each newly exposed agent is attributed to one
+        infectious neighbour and that infector's n_sec is incremented. This is
+        the basis of the faithful, tau-free reproduction number (see notes)."""
         inf = self.state == INFECTIOUS
         sus = self.state == SUSCEPTIBLE
         if not inf.any() or not sus.any():
             return 0
 
-        grid = np.zeros((self.L, self.L), dtype=bool)
-        grid[self.x[inf], self.y[inf]] = True
-        dil = self._dilate3x3(grid)
-
-        sus_idx = np.where(sus)[0]
-        hit = dil[self.x[sus_idx], self.y[sus_idx]]
-        newly = sus_idx[hit]
-        self.state[newly] = EXPOSED          # -> EXPOSED, not INFECTIOUS (paper)
-        self.counter[newly] = 0
-        return int(newly.size)
-
-    def _dilate3x3(self, grid: np.ndarray) -> np.ndarray:
-        """Binary 3x3 dilation without edge wrap (faithful to clamped grid)."""
         L = self.L
-        pad = np.zeros((L + 2, L + 2), dtype=bool)
-        pad[1:-1, 1:-1] = grid
-        out = np.zeros((L, L), dtype=bool)
+        # one infector id per occupied cell (last-writer-wins; fine on a sparse grid)
+        owner = np.full((L, L), -1, dtype=np.int32)
+        inf_idx = np.where(inf)[0]
+        owner[self.x[inf_idx], self.y[inf_idx]] = inf_idx
+
+        # propagate infector ids into the 3x3 neighbourhood (no edge wrap)
+        pad = np.full((L + 2, L + 2), -1, dtype=np.int32)
+        pad[1:-1, 1:-1] = owner
+        big = np.full((L, L), -1, dtype=np.int32)
         for dx in (0, 1, 2):
             for dy in (0, 1, 2):
-                out |= pad[dx:dx + L, dy:dy + L]
-        return out
+                src = pad[dx:dx + L, dy:dy + L]
+                take = (big < 0) & (src >= 0)
+                big[take] = src[take]
+
+        sus_idx = np.where(sus)[0]
+        infector = big[self.x[sus_idx], self.y[sus_idx]]
+        hit = infector >= 0
+        newly = sus_idx[hit]
+        if newly.size:
+            np.add.at(self.n_sec, infector[hit], 1)
+            self.state[newly] = EXPOSED
+            self.counter[newly] = 0
+        return int(newly.size)
 
     def _age_and_transition(self):
-        """Once-per-day aging and E->I, I->(R or D) transitions.
-
-        Masks for E and I are taken BEFORE any transition so that an agent that
-        moves E->I today is not also tested for recovery today.
-        Durations use the pseudocode's re-drawn-offset scheme (disagreement #7);
-        for a fixed per-person duration instead, draw the threshold once at the
-        moment of infection and compare counter >= that threshold.
-        """
+        """Once-per-day aging and E->I, I->(R or D) transitions."""
         mask_E = self.state == EXPOSED
         mask_I = self.state == INFECTIOUS
+        sfrac = float((self.state == SUSCEPTIBLE).sum()) / self.N  # for cohort tagging
         self.counter[mask_E] += 1
         self.counter[mask_I] += 1
 
@@ -214,6 +221,7 @@ class PandemicEnv:
             t_idx = e_idx[trans]
             self.state[t_idx] = INFECTIOUS
             self.counter[t_idx] = 0
+            self.sfrac0[t_idx] = sfrac               # S/N at the moment this agent turns infectious
             new_infectious = int(t_idx.size)
 
         # Infectious -> Recovered / Dead
@@ -223,12 +231,13 @@ class PandemicEnv:
             done = (self.counter[i_idx] - r) >= self.infectious_days
             d_idx = i_idx[done]
             if d_idx.size:
-                dead = self.rng.random(d_idx.size) < self.death_prob   # ~20% (disagreement #5)
+                dead = self.rng.random(d_idx.size) < self.death_prob
                 dead_idx = d_idx[dead]
                 rec_idx = d_idx[~dead]
                 self.state[dead_idx] = DEAD
                 self.state[rec_idx] = RECOVERED
                 self.counter[rec_idx] = 0
+                self.completed[d_idx] = True          # infectious life finished -> n_sec is final
                 new_deaths = int(dead_idx.size)
                 new_cured = int(rec_idx.size)
 
